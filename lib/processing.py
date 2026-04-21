@@ -1,0 +1,416 @@
+"""Shared processing module — centralizes compute, params, and utils.
+
+Used by standard_analysis, upm_analysis, and any future view that needs
+RPLT processing. No view should duplicate this logic.
+"""
+
+from __future__ import annotations
+
+import re
+
+import pandas as pd
+import streamlit as st
+
+from .db import quote_identifier, quote_table_identifier
+from .queries import run_custom_query
+from .engine import compute
+
+
+# ── Unit inference — look at the column header to figure out what
+# the user's data is actually in, so the dashboard produces sensible
+# numbers for any acquisition format, not just the RGF demo file. ──────────
+
+_TIME_SCALE = {
+    # (regex against lowercased header) → multiplier that takes the raw
+    # value to seconds. Order matters — most specific first.
+    r"\bs(ec(onds?)?)?\b": 1.0,
+    r"\bms\b|millisec": 1e-3,
+    r"\bus\b|\bμs\b|microsec": 1e-6,
+    r"\bns\b|nanosec": 1e-9,
+}
+
+
+def infer_time_scale(col_name: str) -> tuple[float, str]:
+    """Return ``(multiplier, detected_unit)`` based on the header.
+
+    Examples
+    --------
+    >>> infer_time_scale("Time (us)")
+    (1e-6, 'us')
+    >>> infer_time_scale("Time (s)")
+    (1.0, 's')
+    >>> infer_time_scale("Timestamp")
+    (1.0, 's')     # fall-through default
+    """
+    low = col_name.lower()
+    # Strip out the base name — keep whatever's in the unit parentheses
+    # or whatever sits after it
+    for pattern, mult in _TIME_SCALE.items():
+        if re.search(pattern, low):
+            label = re.search(pattern, low).group(0)
+            return mult, label
+    return 1.0, "s"
+
+
+def infer_accel_is_mps2(col_name: str) -> bool:
+    """True if the accel column is already in m/s² (i.e. pre-scaled by
+    the acquisition software and we should NOT multiply by g again).
+
+    Matches ``Acceleration scaled 1``, ``Accel (m/s2)``, ``a_mps2``, etc.
+    """
+    low = col_name.lower()
+    if "scaled" in low and "accel" in low:
+        return True
+    if re.search(r"m\s*/\s*s\s*[²2]", low):
+        return True
+    if "mps2" in low or "mps²" in low:
+        return True
+    return False
+
+# ── Constants ────────────────────────────────────────────────────────────────
+DEFAULT_SMOOTHING_WINDOW = 120
+DEFAULT_SMOOTHING_TYPE = "linear"
+DEFAULT_UPM_MASS = 12_000.0
+DEFAULT_UPM_STIFFNESS = 1_397_000.0
+
+COL_TIME = "Time (s)"
+COL_LOAD = "Load (kN)"
+COL_ACCEL = "Scaled (m/s2)"
+COL_VELOCITY = "Velocity (m/s)"
+COL_DISP = "Disp (m)"
+COL_SMOOTHED = "Scaled (m/s2) Smoothed"
+COL_FMA = "Fma (kN)"
+COL_FKX = "Fkx (kN)"
+COL_TOTAL_FORCE = "Total Force (kN)"
+
+
+# ── Column utilities ─────────────────────────────────────────────────────────
+def pick_column(cols: list[str], candidates: list[str]) -> str | None:
+    """Find first column whose lowercase name matches a candidate (exact then substring)."""
+    lower = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    for cand in candidates:
+        for c in cols:
+            if cand.lower() in c.lower():
+                return c
+    return cols[0] if cols else None
+
+
+def col_index(items: list[str], target: str | None) -> int:
+    """Safe index lookup with fallback to 0."""
+    if target in items:
+        return items.index(target)
+    return 0
+
+
+# ── Session state for processing params ──────────────────────────────────────
+def _parse_number(val, default: float) -> float:
+    """Parse ``"12,000"`` / ``12000`` / ``"1,397,000.0"`` → float.
+
+    Settings → Processing Defaults stores mass / stiffness as human-
+    readable comma-separated strings; the pipeline needs raw floats.
+    Falls back to ``default`` on parse errors.
+    """
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(str(val).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def get_params() -> dict:
+    """Read processing params from session state, with defaults.
+
+    Priority for each value:
+      1. In-view widget state (``rplt_*`` — set by Standard / UPM views)
+      2. Settings → Processing Defaults (``settings_*``)
+      3. Hard-coded default
+
+    This lets the Settings page act as the global baseline while still
+    letting the user tweak mass / stiffness per-view on the Standard
+    Analysis processing toolbar.
+    """
+    ss = st.session_state
+
+    # Smoothing: inline widget > Settings dropdown (string "Enabled by default") > default
+    smooth_setting = ss.get("settings_smoothing_on", "Enabled by default")
+    smooth_default = smooth_setting.startswith("Enabled") if isinstance(smooth_setting, str) else True
+    apply_smoothing = ss.get("rplt_smoothing", smooth_default)
+
+    smoothing_window = int(_parse_number(
+        ss.get("rplt_smoothing_window",
+               ss.get("settings_smoothing_window", DEFAULT_SMOOTHING_WINDOW)),
+        DEFAULT_SMOOTHING_WINDOW,
+    ))
+    smoothing_type = ss.get(
+        "rplt_smoothing_type",
+        ss.get("settings_smoothing_weight", DEFAULT_SMOOTHING_TYPE),
+    )
+    upm_mass = _parse_number(
+        ss.get("rplt_upm_mass", ss.get("settings_upm_mass", DEFAULT_UPM_MASS)),
+        DEFAULT_UPM_MASS,
+    )
+    upm_stiffness = _parse_number(
+        ss.get("rplt_upm_stiffness", ss.get("settings_upm_stiffness", DEFAULT_UPM_STIFFNESS)),
+        DEFAULT_UPM_STIFFNESS,
+    )
+    return {
+        "apply_smoothing":  apply_smoothing,
+        "smoothing_window": smoothing_window,
+        "smoothing_type":   smoothing_type,
+        "upm_mass":         upm_mass,
+        "upm_stiffness":    upm_stiffness,
+    }
+
+
+def _set(key: str, val) -> None:
+    st.session_state[f"rplt_{key}"] = val
+
+
+# ── Shared processing controls widget ────────────────────────────────────────
+def render_controls(cols: list[str], time_col, accel_col, load_col, key_prefix: str = "p"):
+    """Compact inline parameter row. Returns (time_col, accel_col, load_col, params).
+
+    The column pickers bind to the SHARED ``rgf_map_*`` session-state
+    keys — same keys used by Import Data's Data Setup panel. Picking a
+    column here updates it there (and everywhere else), and vice-versa.
+    Mass / stiffness / smoothing stay per-view so the user can tweak
+    them independently per analysis.
+    """
+    ss = st.session_state
+    # Seed the shared keys with the caller's suggestions (auto-pick
+    # results) on the FIRST call per session. Once set, Streamlit's
+    # selectbox state wins. Also snap any stale value that's no longer
+    # in the active table's column set back to a legal option so the
+    # selectbox doesn't throw.
+    ss.setdefault("rgf_map_time",  time_col or cols[0])
+    ss.setdefault("rgf_map_accel", accel_col or cols[0])
+    ss.setdefault("rgf_map_load",  load_col or cols[0])
+    if ss["rgf_map_time"]  not in cols: ss["rgf_map_time"]  = time_col or cols[0]
+    if ss["rgf_map_accel"] not in cols: ss["rgf_map_accel"] = accel_col or cols[0]
+    if ss["rgf_map_load"]  not in cols: ss["rgf_map_load"]  = load_col or cols[0]
+
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.2, 1.2, 1.2, 0.7, 0.9, 0.9, 1.0, 1.0])
+    with c1:
+        time_col = st.selectbox("Time",  cols, key="rgf_map_time")
+    with c2:
+        accel_col = st.selectbox("Accel", cols, key="rgf_map_accel")
+    with c3:
+        load_col = st.selectbox("Load",  cols, key="rgf_map_load")
+    with c4:
+        smooth = st.checkbox(
+            "Smooth",
+            value=get_params()["apply_smoothing"],
+            key=f"{key_prefix}_smooth",
+        )
+        _set("smoothing", smooth)
+    with c5:
+        smooth_window = st.number_input(
+            "Window",
+            min_value=2,
+            max_value=10_000,
+            value=int(get_params()["smoothing_window"]),
+            step=1,
+            key=f"{key_prefix}_window",
+        )
+        _set("smoothing_window", int(smooth_window))
+    with c6:
+        smooth_options = ["linear", "exponential", "uniform"]
+        current_smoothing = get_params()["smoothing_type"]
+        smooth_index = smooth_options.index(current_smoothing) if current_smoothing in smooth_options else 0
+        smooth_type = st.selectbox(
+            "Weight",
+            smooth_options,
+            index=smooth_index,
+            key=f"{key_prefix}_smoothing_type",
+        )
+        _set("smoothing_type", smooth_type)
+    with c7:
+        mass = st.number_input("Mass (kg)", value=get_params()["upm_mass"],
+                               min_value=0.1, max_value=1e8, format="%.0f", key=f"{key_prefix}_mass")
+        _set("upm_mass", mass)
+    with c8:
+        stiff = st.number_input(
+            "k (N/m)",
+            value=get_params()["upm_stiffness"],
+            min_value=0.1,
+            max_value=1e12,
+            format="%.0f",
+            key=f"{key_prefix}_stiff",
+        )
+        _set("upm_stiffness", stiff)
+
+    params = {
+        "apply_smoothing": smooth,
+        "smoothing_window": int(smooth_window),
+        "smoothing_type": smooth_type,
+        "upm_mass": mass,
+        "upm_stiffness": stiff,
+    }
+    return time_col, accel_col, load_col, params
+
+
+# ── Run compute with spinner + validation ────────────────────────────────────
+def run_processing(table_name: str, version: float,
+                   time_col: str, accel_col: str, load_col: str,
+                   params: dict) -> pd.DataFrame | None:
+    """Run compute() with spinner. Returns DataFrame or None on error."""
+    qt = quote_table_identifier(table_name)
+    raw_sql = (
+        "SELECT "
+        f"{quote_identifier(time_col)} AS __time, "
+        f"{quote_identifier(accel_col)} AS __accel, "
+        f"{quote_identifier(load_col)} AS __load "
+        f"FROM {qt} ORDER BY __time"
+    )
+    raw_df = run_custom_query(raw_sql, version=version)
+
+    if raw_df.empty or len(raw_df) < 2:
+        st.warning("Not enough data to process.")
+        return None
+
+    t = pd.to_numeric(raw_df["__time"], errors="coerce")
+    a = pd.to_numeric(raw_df["__accel"], errors="coerce")
+    l = pd.to_numeric(raw_df["__load"], errors="coerce")
+    # When the user is going to derive accel from load (a = F/M), we
+    # don't need a valid accel column — skip it in the validity mask so
+    # we don't throw away every row just because accel is NaN there.
+    _ss_derive = st.session_state.get("rgf_unit_accel") == "derive"
+    if _ss_derive:
+        valid = t.notna() & l.notna()
+    else:
+        valid = t.notna() & a.notna() & l.notna()
+    if not valid.any():
+        st.error("Selected columns are not numeric enough for processing.")
+        return None
+    t = t[valid]
+    a = a[valid]
+    l = l[valid]
+    if len(t) < 2:
+        st.warning("Need at least 2 valid numeric samples after cleaning.")
+        return None
+
+    # ── Unit correction ─────────────────────────────────────────────────
+    # Priority: explicit user override from the Import Data → Data Units
+    # panel, then header-based auto-detect, then "as-is". Every override
+    # key defaults to ``"auto"`` so existing behaviour is preserved.
+    ss = st.session_state
+    G_CONST = 9.81
+    _TIME_UNITS = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}
+    _ACCEL_MODES = {"raw_g", "g", "mps2"}
+    _LOAD_UNITS = {"kN": 1.0, "N": 1e-3, "lbf": 0.00444822}
+
+    # 1) Time
+    t_override = ss.get("rgf_unit_time", "auto")
+    if t_override in _TIME_UNITS:
+        time_scale, time_unit = _TIME_UNITS[t_override], t_override
+    else:
+        time_scale, time_unit = infer_time_scale(time_col)
+    if time_scale != 1.0:
+        t = t * time_scale
+
+    # 3) Load (resolved first; derive-mode for accel depends on load)
+    l_override = ss.get("rgf_unit_load", "auto")
+    load_scale = _LOAD_UNITS.get(l_override, 1.0)
+    if load_scale != 1.0:
+        l = l * load_scale
+
+    # 2) Acceleration
+    a_override = ss.get("rgf_unit_accel", "auto")
+    derive_accel_from_load = (a_override == "derive")
+
+    if derive_accel_from_load:
+        # Newton's 2nd law — a(t) = F(t) / M. Load enters in kN so we
+        # bump to N first. Mass comes from the UPM parameter; if the
+        # user left it at the default we still get a sensible answer.
+        #
+        # Files that use derive-mode (e.g. an acquisition log with a
+        # broken accel channel but a clean load channel) are typically
+        # LONG — multi-second recordings with a short impact embedded.
+        # Integrating `a = F/M` over the whole recording amplifies any
+        # DC bias in Load summ into multi-meter displacement garbage,
+        # even with drift-fix. So we crop every array (t, a, l) to the
+        # event window around the load peak BEFORE feeding compute. This
+        # is only done in derive mode — sensor-driven flows keep their
+        # full-time integration.
+        from lib.charts.helpers import detect_event_window
+        mass = float(params.get("upm_mass") or DEFAULT_UPM_MASS)
+        if mass <= 0:
+            mass = DEFAULT_UPM_MASS
+        l_arr = l.to_numpy()
+        # contiguous_run mode: anchor the window to the peak and widen
+        # until we see 50 consecutive below-threshold samples. Handles
+        # recordings with non-zero baseline / drift (e.g. Load summ that
+        # ends at 80 kN far from zero).
+        s_idx, e_idx = detect_event_window(
+            l_arr, threshold_pct=0.20, contiguous_run=50,
+        )
+        t = t.iloc[s_idx:e_idx + 1].reset_index(drop=True)
+        a = a.iloc[s_idx:e_idx + 1].reset_index(drop=True)
+        l = l.iloc[s_idx:e_idx + 1].reset_index(drop=True)
+        # Re-zero the time origin at the window start so downstream
+        # charts show 0 at the impact moment (matches RPLT convention).
+        t = t - t.iloc[0]
+        a_for_compute = (l.to_numpy() * 1000.0 / mass) / G_CONST
+        # Derived accel has NO sensor DC bias — the event-window crop
+        # already discarded any baseline offset. Flag as "already g,
+        # centered" so compute skips auto_zero_mean (which would
+        # otherwise subtract the mean of the impulse itself and flatten
+        # the peak by ~50%).
+        accel_mps2 = False
+        accel_already_g = True
+    elif a_override in _ACCEL_MODES:
+        accel_mps2 = (a_override == "mps2")
+        accel_already_g = (a_override == "g")
+    else:
+        accel_mps2 = infer_accel_is_mps2(accel_col)
+        accel_already_g = False
+
+    # When the column is m/s², divide by g so the pipeline's auto-zero-mean
+    # + ``× g_const`` round-trips to the same m/s² value. When the column
+    # is already in ±1g (pre-centered), we also feed it in as ±g but skip
+    # auto-zero-mean since it's already centered.
+    if not derive_accel_from_load:
+        if accel_mps2:
+            a_for_compute = a / G_CONST
+        else:
+            a_for_compute = a  # raw or ±1g — compute handles via auto_zero_mean
+
+    with st.spinner("Processing..."):
+        try:
+            result = compute(
+                time=tuple(t.tolist()),
+                accel_raw=tuple(a_for_compute.tolist()),
+                # When accel is explicitly "±1g (already centered)" skip
+                # auto-zero-mean so the pipeline just multiplies by g.
+                use_auto_zero_mean=not accel_already_g,
+                accel_offset=0.0,
+                accel_sens=1.0,
+                # Drift-fix assumes the rigid body returns to rest at the
+                # end of the recording. True for full-length acquisitions;
+                # false for derive-mode (we cropped to the impulse itself,
+                # where the body is still moving at window end — forcing
+                # v_end=0 there artificially damps the curve).
+                drift_fix_velocity=not derive_accel_from_load,
+                load_input="original",
+                load_original=tuple(l.tolist()),
+                apply_smoothing=params["apply_smoothing"],
+                smoothing_window=params["smoothing_window"],
+                smoothing_type=params["smoothing_type"],
+                upm_mass=params["upm_mass"],
+                upm_stiffness=params["upm_stiffness"],
+            )
+        except Exception as exc:
+            st.error(f"Processing failed: {exc}")
+            return None
+
+    if result.empty:
+        st.warning("Processing returned no data.")
+        return None
+
+    return result

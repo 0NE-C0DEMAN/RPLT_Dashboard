@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RPLT Dashboard Redesign</title>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300..700;1,9..40,300..700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --navy: #0f1729;
+    --navy-light: #1a2744;
+    --surface: #ffffff;
+    --bg: #f3f5f9;
+    --border: #e2e6ee;
+    --text: #0f1729;
+    --text-2: #475569;
+    --text-3: #94a3b8;
+    --emerald: #10b981;
+    --radius: 10px;
+    --font: 'DM Sans', system-ui, sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+  }
+  html, body, #root { height: 100%; margin: 0; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text); -webkit-font-smoothing: antialiased; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  button:hover { opacity: 0.85; }
+  input:focus, select:focus { border-color: #10b981 !important; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- Component scripts -->
+<script type="text/babel" src="components/icons.jsx"></script>
+<script type="text/babel" src="components/mockdata.jsx"></script>
+<script type="text/babel" src="components/charts.jsx"></script>
+<script type="text/babel" src="components/ui.jsx"></script>
+<script type="text/babel" src="components/view-dashboard.jsx"></script>
+<script type="text/babel" src="components/views.jsx"></script>
+<script type="text/babel" src="components/view-chartbuilder.jsx"></script>
+<script type="text/babel" src="components/view-settings.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "accentColor": "#10b981",
+  "navStyle": "dark",
+  "chartFill": true,
+  "monoNumbers": true
+}/*EDITMODE-END*/;
+
+const VIEWS = {
+  dashboard: () => <DashboardView />,
+  import: () => <ImportView />,
+  standard: () => <StandardView />,
+  upm: () => <UPMView />,
+  cycles: () => <CycleView />,
+  builder: () => <ChartBuilderView />,
+  report: () => <ReportView />,
+  data: () => <RawDataView />,
+  settings: () => <SettingsView />,
+};
+
+const App = () => {
+  const [view, setView] = useState(() => localStorage.getItem('rplt_view') || 'dashboard');
+  const [tweaks, setTweaks] = useState(TWEAK_DEFAULTS);
+  const [showTweaks, setShowTweaks] = useState(false);
+
+  useEffect(() => { localStorage.setItem('rplt_view', view); }, [view]);
+
+  // Tweaks protocol
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.data?.type === '__activate_edit_mode') setShowTweaks(true);
+      if (e.data?.type === '__deactivate_edit_mode') setShowTweaks(false);
+    };
+    window.addEventListener('message', handler);
+    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
+  const updateTweak = (key, val) => {
+    setTweaks(prev => {
+      const next = { ...prev, [key]: val };
+      window.parent.postMessage({ type: '__edit_mode_set_keys', edits: { [key]: val } }, '*');
+      return next;
+    });
+  };
+
+  const ViewComponent = VIEWS[view] || VIEWS.dashboard;
+
+  return (
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+      <Sidebar active={view} onNav={setView} />
+      <div style={{ flex: 1, overflow: 'auto', padding: '24px 28px' }}>
+        <ViewComponent />
+      </div>
+
+      {/* Tweaks panel */}
+      {showTweaks && (
+        <div style={{
+          position: 'fixed', bottom: 16, right: 16, width: 260, background: 'white',
+          borderRadius: 12, border: '1px solid var(--border)', padding: '16px',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.12)', zIndex: 1000,
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 14, color: 'var(--text)' }}>Tweaks</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Accent Color</label>
+              <div style={{ display: 'flex', gap: 6 }}>
+                {['#10b981','#3b82f6','#8b5cf6','#f59e0b','#ef4444'].map(c => (
+                  <button key={c} onClick={() => updateTweak('accentColor', c)} style={{
+                    width: 28, height: 28, borderRadius: 7, background: c, border: tweaks.accentColor === c ? '2px solid var(--text)' : '2px solid transparent',
+                    cursor: 'pointer', transition: 'all 0.15s',
+                  }} />
+                ))}
+              </div>
+            </div>
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Chart Fill</label>
+              <button onClick={() => updateTweak('chartFill', !tweaks.chartFill)} style={{
+                padding: '5px 12px', fontSize: 12, borderRadius: 6, cursor: 'pointer',
+                background: tweaks.chartFill ? '#f0fdf4' : '#f8f9fb', border: `1px solid ${tweaks.chartFill ? '#a7f3d0' : 'var(--border)'}`,
+                color: tweaks.chartFill ? '#059669' : 'var(--text-3)', fontFamily: 'var(--font)', fontWeight: 500,
+              }}>{tweaks.chartFill ? 'Filled' : 'Line only'}</button>
+            </div>
+            <div>
+              <label style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Mono Numbers</label>
+              <button onClick={() => updateTweak('monoNumbers', !tweaks.monoNumbers)} style={{
+                padding: '5px 12px', fontSize: 12, borderRadius: 6, cursor: 'pointer',
+                background: tweaks.monoNumbers ? '#f0fdf4' : '#f8f9fb', border: `1px solid ${tweaks.monoNumbers ? '#a7f3d0' : 'var(--border)'}`,
+                color: tweaks.monoNumbers ? '#059669' : 'var(--text-3)', fontFamily: 'var(--font)', fontWeight: 500,
+              }}>{tweaks.monoNumbers ? 'On' : 'Off'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

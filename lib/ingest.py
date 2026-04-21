@@ -140,8 +140,13 @@ def resolve_demo_ingest_path(session_id: str) -> Path:
     when the binary was never committed — write a small synthetic Sheet1 into
     the session upload dir so Load Demo still works.
     """
-    if DEMO_BUNDLED_XLSX.is_file():
-        return copy_local_to_session(DEMO_BUNDLED_XLSX, session_id)
+    if DEMO_BUNDLED_XLSX.exists():
+        try:
+            return copy_local_to_session(DEMO_BUNDLED_XLSX, session_id)
+        except OSError:
+            # Cloud/runtime filesystem edge case: if the bundled file exists
+            # but cannot be opened/copied, fall back to generated demo data.
+            pass
     dest = session_upload_dir(session_id) / "RPLTResults_demo.xlsx"
     if not dest.exists():
         _write_synthetic_demo_xlsx(dest)

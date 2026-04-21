@@ -83,8 +83,8 @@ def render() -> None:
 
 def _load_demo() -> None:
     sid = session_id()
-    src_path = resolve_demo_ingest_path(sid)
     try:
+        src_path = resolve_demo_ingest_path(sid)
         result = ingest_file(src_path, sid, sheet_name="Sheet1")
     except Exception as exc:
         st.error(f"Demo load failed: {exc}")

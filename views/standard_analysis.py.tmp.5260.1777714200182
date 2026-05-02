@@ -351,7 +351,50 @@ def _render_phase_space(
     )
 
 
-# ── Composite dual-axis time history (Row 4) ─────────────────────────────────
+# ── XY cross-plot helper (Row 4) ─────────────────────────────────────────────
+def _render_xy_panel(
+    title: str,
+    xy_pairs: list,
+    *,
+    color: str,
+    label: str,
+    x_label: str,
+    y_label: str,
+    key: str,
+) -> None:
+    """One generic XY cross-plot panel.
+
+    Draws a closed-loop trajectory through ``xy_pairs`` with start / end
+    markers + an origin cross. Used for the four additional combinations
+    John requested in his review (Load↔Vel, Load↔Accel, Accel↔Vel,
+    Accel↔Disp). Same chart-engine path as the existing hysteresis +
+    phase-space plots — just generalised so callers can re-use it.
+    """
+    if len(xy_pairs) < 3:
+        return
+    chart_panel(
+        title,
+        [series_xy(xy_pairs, color, label)],
+        x_data=[],
+        x_label=x_label,
+        y_label=y_label,
+        height=_H_ROW3,
+        actions_html=icon_btn("download", title="Export"),
+        key=key,
+        annotations=[
+            {"type": "vline", "x": 0.0, "color": "#94a3b8"},
+            {"type": "hline", "y": 0.0, "color": "#94a3b8"},
+            {"type": "point", "x": float(xy_pairs[0][0]),  "y": float(xy_pairs[0][1]),
+             "label": "Start", "color": _C_START, "shape": "circle",
+             "label_offset": "bottom"},
+            {"type": "point", "x": float(xy_pairs[-1][0]), "y": float(xy_pairs[-1][1]),
+             "label": "End", "color": _C_END, "shape": "circle",
+             "label_offset": "right"},
+        ],
+    )
+
+
+# ── Composite dual-axis time history (Row 5) ─────────────────────────────────
 _COMPOSITE_PAIRS = [
     # (id, button label, primary signal, secondary signal)
     ("lv", "Load + Velocity",         "load",  "vel"),

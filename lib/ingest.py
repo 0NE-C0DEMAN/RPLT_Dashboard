@@ -59,10 +59,6 @@ class TableInfo:
     sheet_name: str | None
     ingested_at: float
 
-    @property
-    def ingested_at_str(self) -> str:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ingested_at))
-
 
 def save_metadata(info: TableInfo) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

@@ -321,7 +321,7 @@ def _render_data_panel(df: pd.DataFrame) -> None:
 
     load_cols = {c for c in window.columns if "load" in c.lower()}
     rows_html: list[str] = []
-    for local_idx, (orig_idx, row) in enumerate(window.iterrows(), start=start + 1):
+    for local_idx, (_orig_idx, row) in enumerate(window.iterrows(), start=start + 1):
         cells = [f'<td class="rgf-rd-rownum">{local_idx}</td>']
         for col, val in zip(window.columns, row):
             tdcls = ' class="rgf-rd-load"' if col in load_cols else ""

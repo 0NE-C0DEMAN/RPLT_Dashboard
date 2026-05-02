@@ -69,18 +69,6 @@ RADIUS_LG = 14
 SIDEBAR_W          = 240
 SIDEBAR_W_COLLAPSED = 64
 
-# ── Chart palette (Plotly colorway + Chart Builder categorical series) ────────
-CHART_PALETTE = [
-    "#10b981",  # accent green
-    "#3b82f6",  # blue
-    "#f59e0b",  # amber
-    "#8b5cf6",  # violet
-    "#ef4444",  # red
-    "#06b6d4",  # cyan
-    "#ec4899",  # pink
-    "#84cc16",  # lime
-]
-
 
 def tokens_dict() -> dict[str, str | int]:
     """Flat dict for CSS template interpolation via ``str.format_map``.

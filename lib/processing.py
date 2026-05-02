@@ -246,15 +246,15 @@ DEFAULT_SMOOTHING_TYPE = "linear"
 DEFAULT_UPM_MASS = 12_000.0
 DEFAULT_UPM_STIFFNESS = 1_397_000.0
 
-COL_TIME = "Time (s)"
-COL_LOAD = "Load (kN)"
-COL_ACCEL = "Scaled (m/s2)"
+# Output-column names emitted by ``compute()``. Views import these
+# instead of hard-coding strings, so a rename of the underlying column
+# only needs a single edit here.
+COL_TIME     = "Time (s)"
+COL_LOAD     = "Load (kN)"
+COL_ACCEL    = "Scaled (m/s2)"
 COL_VELOCITY = "Velocity (m/s)"
-COL_DISP = "Disp (m)"
+COL_DISP     = "Disp (m)"
 COL_SMOOTHED = "Scaled (m/s2) Smoothed"
-COL_FMA = "Fma (kN)"
-COL_FKX = "Fkx (kN)"
-COL_TOTAL_FORCE = "Total Force (kN)"
 
 
 # ── Column utilities ─────────────────────────────────────────────────────────
@@ -269,13 +269,6 @@ def pick_column(cols: list[str], candidates: list[str]) -> str | None:
             if cand.lower() in c.lower():
                 return c
     return cols[0] if cols else None
-
-
-def col_index(items: list[str], target: str | None) -> int:
-    """Safe index lookup with fallback to 0."""
-    if target in items:
-        return items.index(target)
-    return 0
 
 
 # ── Session state for processing params ──────────────────────────────────────
@@ -481,9 +474,9 @@ def run_processing(table_name: str, version: float,
     # 1) Time
     t_override = ss.get("rgf_unit_time", "auto")
     if t_override in _TIME_UNITS:
-        time_scale, time_unit = _TIME_UNITS[t_override], t_override
+        time_scale = _TIME_UNITS[t_override]
     else:
-        time_scale, time_unit = infer_time_scale(time_col)
+        time_scale, _ = infer_time_scale(time_col)
     if time_scale != 1.0:
         t = t * time_scale
 

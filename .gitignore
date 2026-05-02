@@ -60,5 +60,9 @@ upm_reference.png
 # Ad-hoc debug plots produced during data-validation scripts
 debug_*.png
 
+# Editor backup files (some IDEs drop these on save)
+*.py.tmp.*
+*.tmp.*
+
 # AI coding agent per-project config (launch profiles, settings, etc.)
 .claude/

@@ -171,6 +171,7 @@ st.components.v1.html(
         ['data-rb-toggle', '.st-key-__rb_toggle_'],
         ['data-rd-page',  '.st-key-__rd_page_'],
         ['data-settings-tab', '.st-key-__settings_tab_'],
+        ['data-std-composite', '.st-key-__std_composite_'],
       ];
 
       if (!doc.__rgfBridged) {

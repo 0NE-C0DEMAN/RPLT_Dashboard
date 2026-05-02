@@ -21,6 +21,8 @@ dashboard: the Load-vs-Displacement hysteresis loop and the Phase-Space
 """
 from __future__ import annotations
 
+import html as html_mod
+
 import numpy as np
 import streamlit as st
 
@@ -228,6 +230,61 @@ def render() -> None:
     with c6:
         _render_phase_space(vel_ev, disp_ev, disp_unit)
 
+    # ── Row 4: Additional cross-plots requested by John (review note) ─
+    # Load-vs-Vel · Load-vs-Accel · Accel-vs-Vel · Accel-vs-Disp.
+    # Same event-cropped indices as Row 3 so the loops focus on the
+    # impact and don't get squashed by the long quiet tail.
+    accel_full = computed[COL_ACCEL].to_numpy()
+    accel_ev = accel_full[idx]
+    c7, c8 = st.columns(2, gap="medium")
+    with c7:
+        _render_xy_panel(
+            "Load (kN) vs Velocity (mm/s)",
+            xy_pairs=list(zip(vel_ev.tolist(), load_ev.tolist())),
+            color="#10b981", label="Trajectory",
+            x_label="Velocity (mm/s)", y_label="Load (kN)",
+            key="std_lvv",
+        )
+    with c8:
+        _render_xy_panel(
+            "Load (kN) vs Acceleration (m/s²)",
+            xy_pairs=list(zip(accel_ev.tolist(), load_ev.tolist())),
+            color="#10b981", label="Trajectory",
+            x_label="Acceleration (m/s²)", y_label="Load (kN)",
+            key="std_lva",
+        )
+    c9, c10 = st.columns(2, gap="medium")
+    with c9:
+        _render_xy_panel(
+            "Acceleration (m/s²) vs Velocity (mm/s)",
+            xy_pairs=list(zip(vel_ev.tolist(), accel_ev.tolist())),
+            color="#8b5cf6", label="Trajectory",
+            x_label="Velocity (mm/s)", y_label="Acceleration (m/s²)",
+            key="std_avv",
+        )
+    with c10:
+        _render_xy_panel(
+            f"Acceleration (m/s²) vs Displacement ({disp_unit})",
+            xy_pairs=list(zip(disp_ev.tolist(), accel_ev.tolist())),
+            color="#8b5cf6", label="Trajectory",
+            x_label=f"Displacement ({disp_unit})", y_label="Acceleration (m/s²)",
+            key="std_avd",
+        )
+
+    # ── Row 5: Composite dual-axis time history ──────────────────────
+    # User picks which two signals to overlay on a shared time axis;
+    # the second renders against a secondary y-axis on the right so
+    # disparate magnitudes (e.g. Load 2200 kN + Velocity 300 mm/s)
+    # both stay visually readable. Same event window as the cross-plots.
+    _render_composite_time_history(
+        t_ev=t[idx],
+        load_ev=load_ev,
+        accel_ev=accel_ev,
+        vel_ev=vel_ev,
+        disp_ev=disp_ev,
+        disp_unit=disp_unit,
+    )
+
 
 # ── Row-3 chart builders ─────────────────────────────────────────────────────
 def _render_load_vs_disp(
@@ -327,6 +384,136 @@ def _render_phase_space(
              "label": "End", "color": _C_END, "shape": "circle",
              "label_offset": "right"},
         ],
+    )
+
+
+# ── XY cross-plot helper (Row 4) ─────────────────────────────────────────────
+def _render_xy_panel(
+    title: str,
+    xy_pairs: list,
+    *,
+    color: str,
+    label: str,
+    x_label: str,
+    y_label: str,
+    key: str,
+) -> None:
+    """One generic XY cross-plot panel.
+
+    Draws a closed-loop trajectory through ``xy_pairs`` with start / end
+    markers + an origin cross. Used for the four additional combinations
+    John requested in his review (Load↔Vel, Load↔Accel, Accel↔Vel,
+    Accel↔Disp). Same chart-engine path as the existing hysteresis +
+    phase-space plots — just generalised so callers can re-use it.
+    """
+    if len(xy_pairs) < 3:
+        return
+    chart_panel(
+        title,
+        [series_xy(xy_pairs, color, label)],
+        x_data=[],
+        x_label=x_label,
+        y_label=y_label,
+        height=_H_ROW3,
+        actions_html=icon_btn("download", title="Export"),
+        key=key,
+        annotations=[
+            {"type": "vline", "x": 0.0, "color": "#94a3b8"},
+            {"type": "hline", "y": 0.0, "color": "#94a3b8"},
+            {"type": "point", "x": float(xy_pairs[0][0]),  "y": float(xy_pairs[0][1]),
+             "label": "Start", "color": _C_START, "shape": "circle",
+             "label_offset": "bottom"},
+            {"type": "point", "x": float(xy_pairs[-1][0]), "y": float(xy_pairs[-1][1]),
+             "label": "End", "color": _C_END, "shape": "circle",
+             "label_offset": "right"},
+        ],
+    )
+
+
+# ── Composite dual-axis time history (Row 5) ─────────────────────────────────
+_COMPOSITE_PAIRS = [
+    # (id, button label, primary signal, secondary signal)
+    ("lv", "Load + Velocity",         "load",  "vel"),
+    ("la", "Load + Acceleration",     "load",  "accel"),
+    ("ld", "Load + Displacement",     "load",  "disp"),
+    ("vd", "Velocity + Displacement", "vel",   "disp"),
+    ("av", "Accel + Velocity",        "accel", "vel"),
+    ("ad", "Accel + Displacement",    "accel", "disp"),
+]
+_SIGNAL_META: dict = {
+    # key → (color, label-template, axis-default-side)
+    "load":  ("#10b981", "Load (kN)",        "left"),
+    "vel":   ("#f59e0b", "Velocity (mm/s)",  "right"),
+    "accel": ("#8b5cf6", "Accel (m/s²)",     "right"),
+    "disp":  ("#3b82f6", "Disp ({u})",       "right"),
+}
+
+
+def _render_composite_time_history(
+    *,
+    t_ev,
+    load_ev,
+    vel_ev,
+    accel_ev,
+    disp_ev,
+    disp_unit: str,
+) -> None:
+    """Pickable two-signal time-history overlay with a secondary y-axis.
+
+    User clicks one of six combinations in the toolbar (data-attr
+    bridged through ``__std_composite_<id>``). Each combo paints the
+    primary signal against the LEFT y-axis (its native units) and the
+    secondary against the RIGHT y-axis, so two signals with vastly
+    different magnitudes (Load kN + Velocity mm/s) both stay readable.
+    """
+    ss = st.session_state
+    ss.setdefault("std_composite", "lv")
+
+    # Hidden trigger buttons — visible toolbar pills bridge to these
+    for cid, _label, _p, _s in _COMPOSITE_PAIRS:
+        if st.button("·", key=f"__std_composite_{cid}"):
+            ss["std_composite"] = cid
+            st.rerun()
+
+    active_cid = ss["std_composite"]
+    pair = next((p for p in _COMPOSITE_PAIRS if p[0] == active_cid), _COMPOSITE_PAIRS[0])
+    _, _label_active, primary_id, secondary_id = pair
+
+    signal_data = {
+        "load":  np.asarray(load_ev,  dtype=float),
+        "vel":   np.asarray(vel_ev,   dtype=float),
+        "accel": np.asarray(accel_ev, dtype=float),
+        "disp":  np.asarray(disp_ev,  dtype=float),
+    }
+
+    def _meta(sid: str):
+        color, label, default_side = _SIGNAL_META[sid]
+        return color, label.format(u=disp_unit), default_side
+
+    p_color, p_label, _ = _meta(primary_id)
+    s_color, s_label, _ = _meta(secondary_id)
+
+    # Visible pill toolbar
+    pills = "".join(
+        '<button type="button" '
+        + f'class="rgf-btn-sm{" active" if cid == active_cid else ""}" '
+        + f'data-std-composite="{cid}">{html_mod.escape(label)}</button>'
+        for cid, label, _, _ in _COMPOSITE_PAIRS
+    )
+
+    chart_panel(
+        f"Composite — {_label_active}",
+        [
+            series(signal_data[primary_id],   p_color, p_label, axis="left",  filled=True),
+            series(signal_data[secondary_id], s_color, s_label, axis="right", filled=False),
+        ],
+        x_data=t_ev,
+        x_label="Time (s)",
+        y_label=p_label,
+        y_label_right=s_label,
+        height=_H_ROW3,
+        actions_html=pills + icon_btn("download", title="Export"),
+        key=f"std_composite_{active_cid}",
     )
 
 

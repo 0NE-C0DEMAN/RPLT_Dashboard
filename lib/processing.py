@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -320,66 +321,73 @@ def run_processing(table_name: str, version: float,
     if load_scale != 1.0:
         l = l * load_scale
 
-    # 2) Acceleration
+    # 2) Acceleration mode + 4) Time-window trim
+    # Time trim is applied AFTER unit correction (so user-picked seconds
+    # match what the pipeline sees) but BEFORE compute() so integration
+    # only sees the trimmed window. Order:
+    #   manual range → user-picked [start, end] in seconds
+    #   auto         → event-window detection on the load signal
+    #   off          → no trim, except for derive-from-Load mode which
+    #                  always auto-crops (otherwise integration of
+    #                  load-derived accel over the long quiet tail
+    #                  blows up).
     a_override = ss.get("rgf_unit_accel", "auto")
     derive_accel_from_load = (a_override == "derive")
+    trim_mode = ss.get("rgf_trim_mode", "off")
 
-    if derive_accel_from_load:
-        # Newton's 2nd law — a(t) = F(t) / M. Load enters in kN so we
-        # bump to N first. Mass comes from the UPM parameter; if the
-        # user left it at the default we still get a sensible answer.
-        #
-        # Files that use derive-mode (e.g. an acquisition log with a
-        # broken accel channel but a clean load channel) are typically
-        # LONG — multi-second recordings with a short impact embedded.
-        # Integrating `a = F/M` over the whole recording amplifies any
-        # DC bias in Load summ into multi-meter displacement garbage,
-        # even with drift-fix. So we crop every array (t, a, l) to the
-        # event window around the load peak BEFORE feeding compute. This
-        # is only done in derive mode — sensor-driven flows keep their
-        # full-time integration.
+    # Compute (s_idx, e_idx) for the trim, in indices of the (already
+    # unit-converted) ``t`` series.
+    s_idx, e_idx = 0, len(t) - 1
+    cropped = False
+    if trim_mode == "manual":
+        ts = float(ss.get("rgf_trim_start_s", 0.0))
+        te = float(ss.get("rgf_trim_end_s",   0.0))
+        if te > ts:
+            t_arr = t.to_numpy()
+            mask = (t_arr >= ts) & (t_arr <= te)
+            if mask.any():
+                where = np.where(mask)[0]
+                s_idx, e_idx = int(where[0]), int(where[-1])
+                cropped = s_idx > 0 or e_idx < len(t) - 1
+    elif trim_mode == "auto" or (derive_accel_from_load and trim_mode == "off"):
         from lib.charts.helpers import detect_event_window
-        mass = float(params.get("upm_mass") or DEFAULT_UPM_MASS)
-        if mass <= 0:
-            mass = DEFAULT_UPM_MASS
         l_arr = l.to_numpy()
-        # contiguous_run mode: anchor the window to the peak and widen
-        # until we see 50 consecutive below-threshold samples. Handles
-        # recordings with non-zero baseline / drift (e.g. Load summ that
-        # ends at 80 kN far from zero).
         s_idx, e_idx = detect_event_window(
             l_arr, threshold_pct=0.20, contiguous_run=50,
         )
+        cropped = s_idx > 0 or e_idx < len(l) - 1
+
+    if cropped:
         t = t.iloc[s_idx:e_idx + 1].reset_index(drop=True)
         a = a.iloc[s_idx:e_idx + 1].reset_index(drop=True)
         l = l.iloc[s_idx:e_idx + 1].reset_index(drop=True)
-        # Re-zero the time origin at the window start so downstream
-        # charts show 0 at the impact moment (matches RPLT convention).
+        # Re-zero the time origin at the window start so charts read 0
+        # at the start of the analysis window (RPLT convention).
         t = t - t.iloc[0]
+
+    # Acceleration mode resolution
+    if derive_accel_from_load:
+        # Newton's 2nd law — a(t) = F(t) / M. Used when the file's
+        # accelerometer is unreliable but the load channel is clean.
+        mass = float(params.get("upm_mass") or DEFAULT_UPM_MASS)
+        if mass <= 0:
+            mass = DEFAULT_UPM_MASS
         a_for_compute = (l.to_numpy() * 1000.0 / mass) / G_CONST
-        # Derived accel has NO sensor DC bias — the event-window crop
-        # already discarded any baseline offset. Flag as "already g,
-        # centered" so compute skips auto_zero_mean (which would
-        # otherwise subtract the mean of the impulse itself and flatten
-        # the peak by ~50%).
+        # Derived accel has NO sensor DC bias — the (already applied)
+        # event-window crop discarded any baseline offset. Flag as
+        # ±1g already centered so compute skips auto_zero_mean (which
+        # would otherwise subtract the mean of the impulse itself and
+        # flatten the peak by ~50%).
         accel_mps2 = False
         accel_already_g = True
     elif a_override in _ACCEL_MODES:
         accel_mps2 = (a_override == "mps2")
         accel_already_g = (a_override == "g")
+        a_for_compute = a / G_CONST if accel_mps2 else a
     else:
         accel_mps2 = infer_accel_is_mps2(accel_col)
         accel_already_g = False
-
-    # When the column is m/s², divide by g so the pipeline's auto-zero-mean
-    # + ``× g_const`` round-trips to the same m/s² value. When the column
-    # is already in ±1g (pre-centered), we also feed it in as ±g but skip
-    # auto-zero-mean since it's already centered.
-    if not derive_accel_from_load:
-        if accel_mps2:
-            a_for_compute = a / G_CONST
-        else:
-            a_for_compute = a  # raw or ±1g — compute handles via auto_zero_mean
+        a_for_compute = a / G_CONST if accel_mps2 else a
 
     with st.spinner("Processing..."):
         try:
@@ -393,10 +401,10 @@ def run_processing(table_name: str, version: float,
                 accel_sens=1.0,
                 # Drift-fix assumes the rigid body returns to rest at the
                 # end of the recording. True for full-length acquisitions;
-                # false for derive-mode (we cropped to the impulse itself,
-                # where the body is still moving at window end — forcing
-                # v_end=0 there artificially damps the curve).
-                drift_fix_velocity=not derive_accel_from_load,
+                # false whenever we've cropped to a tight impulse window
+                # (derive-mode or user-trim), since forcing v_end=0 over
+                # a 14ms window flattens the velocity peak by ~50%.
+                drift_fix_velocity=not (derive_accel_from_load or cropped),
                 load_input="original",
                 load_original=tuple(l.tolist()),
                 apply_smoothing=params["apply_smoothing"],

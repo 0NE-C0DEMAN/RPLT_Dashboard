@@ -164,7 +164,8 @@ h1.rgf-pghdr-title {{
 [class*="st-key-__rd_"],
 [class*="st-key-__settings_"],
 [class*="st-key-__sidebar_toggle"],
-[class*="st-key-__dash_"] {{
+[class*="st-key-__dash_"],
+[class*="st-key-__std_"] {{
     position: absolute !important;
     left: -9999px !important;
     top: -9999px !important;

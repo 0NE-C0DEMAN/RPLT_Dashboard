@@ -77,6 +77,7 @@ def render() -> None:
         _render_gcp()
 
     _render_data_setup()
+    _render_trim_panel()
     _render_file_list()
     _render_data_preview()
 
@@ -565,6 +566,144 @@ def _column_stats(_info, version: float, cols: list[str]) -> dict:
             "n":   row[i * 3 + 2],
         }
     return out
+
+
+# ── Trim time range panel ───────────────────────────────────────────────────
+# Many acquisition rigs log multi-second tails of quiescent data either
+# side of the actual impact. Without trimming, integration of any DC
+# bias accumulates into multi-meter displacement garbage. This panel
+# lets the user crop the time window once at ingest — the choice flows
+# into ``run_processing()`` via session state and applies to every view.
+def _render_trim_panel() -> None:
+    info = get_active_info()
+    ss = st.session_state
+
+    ss.setdefault("rgf_trim_mode", "off")     # off / auto / manual
+    ss.setdefault("rgf_trim_start_s", 0.0)
+    ss.setdefault("rgf_trim_end_s",   0.0)
+
+    with st.container(key="rgf_panel_trim"):
+        _panel_open(
+            "rgf_panel_trim",
+            "Time Range",
+            right_html=(
+                badge("Trims every view", "blue")
+                if info else badge("Load a file to begin", "gray")
+            ),
+        )
+
+        if not info:
+            st.markdown(
+                '<div style="font-size:11px;color:var(--text-3);padding:6px 0;">'
+                'After importing a file you can trim the working time window '
+                'here — useful when acquisitions log long quiet tails on either '
+                'side of the impact.</div>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        # Pull the time + load columns the user has picked. We sniff the
+        # full time range straight off DuckDB (cached), then offer either
+        # auto-crop (event-window detection on Load) or a manual range
+        # slider over the actual time values in seconds.
+        t_col = ss.get("rgf_map_time")
+        l_col = ss.get("rgf_map_load")
+        if not (t_col and l_col):
+            st.info("Pick the Time + Load columns in Data Setup first.",
+                    icon=":material/info:")
+            return
+
+        bounds = _time_bounds_seconds(info, t_col)
+        if bounds is None:
+            st.info("Couldn't read the time column as numeric.",
+                    icon=":material/warning:")
+            return
+        t0, t1 = bounds
+        # Apply unit override if set — display range matches the actual
+        # seconds the pipeline will see post-conversion.
+        time_unit_scale = {
+            "s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9,
+        }.get(ss.get("rgf_unit_time", "auto"))
+        if time_unit_scale is None:
+            from lib.processing import infer_time_scale
+            time_unit_scale, _ = infer_time_scale(t_col)
+        t0_s, t1_s = float(t0) * time_unit_scale, float(t1) * time_unit_scale
+
+        # Mode selector: Off / Auto / Manual
+        mode_choices = [
+            ("off",    "Use full recording"),
+            ("auto",   "Auto-crop to impact (load-driven)"),
+            ("manual", "Manual range"),
+        ]
+        keys = [k for k, _ in mode_choices]
+        idx_mode = keys.index(ss["rgf_trim_mode"]) if ss["rgf_trim_mode"] in keys else 0
+        st.selectbox(
+            "Trim mode",
+            keys,
+            format_func=lambda k: dict(mode_choices)[k],
+            index=idx_mode,
+            key="rgf_trim_mode",
+        )
+
+        if ss["rgf_trim_mode"] == "manual":
+            # Streamlit's slider has decent precision, but for sub-ms
+            # impact widths the user wants float seconds with 4-digit
+            # resolution. Step = (range / 500) gives ~500 detents.
+            span = max(t1_s - t0_s, 1e-6)
+            step = max(span / 500.0, 1e-6)
+            cur_start = max(t0_s, min(ss.get("rgf_trim_start_s") or t0_s, t1_s))
+            cur_end   = max(t0_s, min(ss.get("rgf_trim_end_s")   or t1_s, t1_s))
+            if cur_end <= cur_start:
+                cur_start, cur_end = t0_s, t1_s
+            picked = st.slider(
+                f"Range (s) — full file: {t0_s:.4f} → {t1_s:.4f}",
+                min_value=float(t0_s), max_value=float(t1_s),
+                value=(float(cur_start), float(cur_end)),
+                step=float(step),
+                key="rgf_trim_slider",
+            )
+            ss["rgf_trim_start_s"], ss["rgf_trim_end_s"] = picked
+
+        elif ss["rgf_trim_mode"] == "auto":
+            st.markdown(
+                '<div style="font-size:11px;color:var(--text-3);padding:4px 0;">'
+                'Auto-crop runs <code>detect_event_window</code> on the Load '
+                'signal at 20% peak threshold + 50-sample contiguous-below-'
+                'threshold rule, anchored at the load peak. Window applies '
+                'to every downstream view.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="font-size:11px;color:var(--text-3);padding:4px 0;">'
+                'No trimming — every view sees the full recording. Switch '
+                'to <b>Auto-crop</b> for impact-only analysis or <b>Manual '
+                'range</b> to pick the window yourself.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+
+@st.cache_data(show_spinner=False)
+def _time_bounds_seconds(_info, time_col: str) -> tuple[float, float] | None:
+    """Min/max of the time column from DuckDB. Returns raw values
+    (no unit conversion); caller applies the unit scale.
+    """
+    try:
+        from lib.db import get_connection, quote_identifier, quote_table_identifier
+        con = get_connection()
+        tbl = quote_table_identifier(_info.table_name)
+        qc = quote_identifier(time_col)
+        row = con.execute(f"SELECT MIN({qc}), MAX({qc}) FROM {tbl}").fetchone()
+        if row is None:
+            return None
+        lo, hi = row
+        if lo is None or hi is None:
+            return None
+        return float(lo), float(hi)
+    except Exception:
+        return None
 
 
 # ── Imported Files list ──────────────────────────────────────────────────────

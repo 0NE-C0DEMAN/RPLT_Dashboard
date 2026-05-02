@@ -91,6 +91,7 @@ def series(
     filled: bool = True,
     downsample_n: int | None = 1500,
     plot: str = "line",
+    axis: str = "left",
 ) -> dict:
     """Package one series for ``chart_panel``.
 
@@ -100,6 +101,14 @@ def series(
       - ``area``    alias for ``line`` + ``filled=True``.
       - ``scatter`` dots only, no connecting line.
       - ``bar``     vertical bars from y=0 to each value.
+
+    ``axis`` chooses which y-scale the series binds to:
+      - ``left``  (default) — primary y-axis (single-axis charts use this)
+      - ``right`` — secondary y-axis. When at least one series declares
+        ``axis="right"``, the chart draws two y-scales side-by-side and
+        each series renders against its own. Use for combos where the
+        magnitudes differ by orders of magnitude (Load kN vs Velocity
+        mm/s, Load kN vs Accel m/s², etc.).
 
     Downsampling is deferred to ``chart_panel`` so x + every y series
     get reduced at the **same indices** — and using LTTB (Largest
@@ -128,6 +137,7 @@ def series(
         "color": color, "label": label,
         "dashed": dashed, "filled": filled,
         "plot": plot,
+        "axis": "right" if axis == "right" else "left",
         "_budget": downsample_n,
     }
 
@@ -166,6 +176,7 @@ def chart_panel(
     height: int = 240,
     x_label: str = "Time (s)",
     y_label: str = "",
+    y_label_right: str = "",
     actions_html: str = "",
     key: str = "",
     annotations: list[dict] | None = None,
@@ -237,6 +248,7 @@ def chart_panel(
         "x": x_vals,
         "xLabel": x_label,
         "yLabel": y_label,
+        "yLabelRight": y_label_right,
         "annotations": annotations or [],
     })
 
@@ -663,29 +675,48 @@ def _iframe_doc(
     const isGap = v => (v === null || v === undefined || Number.isNaN(v));
     const hasXY = visSeries.some(s => Array.isArray(s.xy));
 
-    // Y-bounds — skip null/NaN. Pull from either s.data or s.xy.
-    let yMin = Infinity, yMax = -Infinity;
-    for (const s of visSeries) {{
-      if (Array.isArray(s.xy)) {{
-        for (const p of s.xy) {{
-          const yv = p[1];
-          if (isGap(yv)) continue;
-          if (yv < yMin) yMin = yv;
-          if (yv > yMax) yMax = yv;
-        }}
-      }} else {{
-        for (const v of s.data) {{
-          if (isGap(v)) continue;
-          if (v < yMin) yMin = v;
-          if (v > yMax) yMax = v;
+    // ── Y-bounds ───────────────────────────────────────────────────────
+    // Build TWO scales (left + right). Series declare their axis via
+    // s.axis === "right". When no series uses right, the right-axis
+    // bookkeeping collapses (right === left) and we render a normal
+    // single-axis chart — no visual change vs the pre-dual-axis era.
+    const computeYBounds = (axisKey) => {{
+      let mn = Infinity, mx = -Infinity;
+      for (const s of visSeries) {{
+        if ((s.axis || 'left') !== axisKey) continue;
+        if (Array.isArray(s.xy)) {{
+          for (const p of s.xy) {{
+            const yv = p[1];
+            if (isGap(yv)) continue;
+            if (yv < mn) mn = yv;
+            if (yv > mx) mx = yv;
+          }}
+        }} else if (Array.isArray(s.data)) {{
+          for (const v of s.data) {{
+            if (isGap(v)) continue;
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+          }}
         }}
       }}
-    }}
-    if (yMin === Infinity) {{ yMin = 0; yMax = 1; }}
-    const yR0 = (yMax - yMin) || 1;
-    const yPadV = yR0 * 0.08;
-    yMin -= yPadV; yMax += yPadV;
-    const yRange = yMax - yMin;
+      if (mn === Infinity) {{ mn = 0; mx = 1; }}
+      const r0 = (mx - mn) || 1;
+      const pad = r0 * 0.08;
+      return [mn - pad, mx + pad];
+    }};
+
+    const hasRightAxis = visSeries.some(s => (s.axis || 'left') === 'right');
+    let [yMinL, yMaxL] = computeYBounds('left');
+    let [yMinR, yMaxR] = hasRightAxis ? computeYBounds('right') : [yMinL, yMaxL];
+
+    // Back-compat aliases — most of the existing code refers to
+    // ``yMin`` / ``yMax`` / ``yRange``. Keep those pointing at the LEFT
+    // axis so all the existing tooling (split-mode, hover crosshair,
+    // annotations against numerical y) still works.
+    let yMin = yMinL, yMax = yMaxL;
+    const yRangeL = yMaxL - yMinL;
+    const yRangeR = yMaxR - yMinR;
+    const yRange = yRangeL;
 
     // X-bounds — real min/max. In XY mode, from xy[i][0] across all
     // xy series; otherwise from visX. Using visX[0]/visX[last] would
@@ -716,10 +747,20 @@ def _iframe_doc(
     xMin -= xPadV; xMax += xPadV;
     const xRange = (xMax - xMin) || 1;
 
-    const cw = w - PAD.l - PAD.r;
+    // Reserve right-side gutter for the secondary y-axis ticks + label.
+    // Ratchets PAD.r upward when the chart is dual-axis; otherwise use
+    // whatever PAD.r the layout pre-set.
+    const padR = hasRightAxis ? Math.max(PAD.r, 56) : PAD.r;
+    const cw = w - PAD.l - padR;
     const ch = h - PAD.t - PAD.b;
     const toX = v => PAD.l + ((v - xMin) / xRange) * cw;
-    const toY = v => PAD.t + ch - ((v - yMin) / yRange) * ch;
+    const toYL = v => PAD.t + ch - ((v - yMinL) / yRangeL) * ch;
+    const toYR = v => PAD.t + ch - ((v - yMinR) / yRangeR) * ch;
+    // Default ``toY`` keeps pointing at the left axis for any code that
+    // doesn't know about dual-axis (annotations, hover crosshair).
+    // Series-aware drawing routines pick toYL / toYR explicitly.
+    const toY = toYL;
+    const toYFor = (s) => ((s && (s.axis || 'left') === 'right') ? toYR : toYL);
 
     // Grid (8×10, slate 0.1 alpha, 0.5 lw — charts.jsx line 164-174)
     ctx.strokeStyle = 'rgba(148,163,184,0.1)';
@@ -733,22 +774,37 @@ def _iframe_doc(
       ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, PAD.t + ch); ctx.stroke();
     }}
 
-    // Axis lines
+    // Axis lines — left + bottom always. Right axis only when dual-axis.
     ctx.strokeStyle = '{BORDER}'; ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(PAD.l, PAD.t); ctx.lineTo(PAD.l, PAD.t + ch); ctx.lineTo(PAD.l + cw, PAD.t + ch);
     ctx.stroke();
+    if (hasRightAxis) {{
+      ctx.beginPath();
+      ctx.moveTo(PAD.l + cw, PAD.t); ctx.lineTo(PAD.l + cw, PAD.t + ch);
+      ctx.stroke();
+    }}
 
     // Y ticks (shared-axis only — split mode draws per-band ticks below,
     // so we skip the panel-wide ones to avoid overlapping labels).
     if (viewMode !== 'split') {{
       ctx.fillStyle = '{TEXT_3}';
       ctx.font = "10px 'JetBrains Mono', monospace";
+      // Left axis ticks
       ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
       for (let i = 0; i <= 4; i++) {{
-        const val = yMin + (yRange / 4) * (4 - i);
+        const val = yMinL + (yRangeL / 4) * (4 - i);
         const y = PAD.t + (ch / 4) * i;
         ctx.fillText(fmtY(val), PAD.l - 6, y + 3);
+      }}
+      // Right axis ticks (dual-axis charts only)
+      if (hasRightAxis) {{
+        ctx.textAlign = 'left';
+        for (let i = 0; i <= 4; i++) {{
+          const val = yMinR + (yRangeR / 4) * (4 - i);
+          const y = PAD.t + (ch / 4) * i;
+          ctx.fillText(fmtY(val), PAD.l + cw + 6, y + 3);
+        }}
       }}
     }}
     // X ticks
@@ -772,6 +828,16 @@ def _iframe_doc(
       ctx.save(); ctx.translate(12, PAD.t + ch / 2); ctx.rotate(-Math.PI / 2);
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(DATA.yLabel, 0, 0); ctx.restore();
+    }}
+    if (DATA.yLabelRight && hasRightAxis) {{
+      // Mirror the left label on the far right edge, rotated +90° so it
+      // reads bottom-up — same convention as the left side.
+      ctx.save();
+      ctx.translate(w - 12, PAD.t + ch / 2);
+      ctx.rotate(Math.PI / 2);
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(DATA.yLabelRight, 0, 0);
+      ctx.restore();
     }}
 
     // XY-pair drawer (declared up-front, before the loop that uses it —
@@ -871,7 +937,8 @@ def _iframe_doc(
 
     // Series — `null` values treated as pen-up gaps. XY-pair series
     // (s.xy) get drawn point-by-point; shared-x series (s.data) get
-    // drawn against visX[i].
+    // drawn against visX[i]. Each series picks its own y-mapper so
+    // dual-axis charts route series to the correct vertical scale.
     for (const s of visSeries) {{
       if (Array.isArray(s.xy)) {{
         drawXYSeries(s);
@@ -879,6 +946,7 @@ def _iframe_doc(
       }}
       const n = s.data.length;
       const plot = s.plot || 'line';
+      const _toY = toYFor(s);
 
       // ── Scatter — dots only, no connecting line ──────────────────────────
       if (plot === 'scatter') {{
@@ -886,7 +954,7 @@ def _iframe_doc(
         for (let i = 0; i < n; i++) {{
           if (isGap(s.data[i])) continue;
           const x = toX(visX[i]);
-          const y = toY(s.data[i]);
+          const y = _toY(s.data[i]);
           ctx.beginPath();
           ctx.arc(x, y, 2.4, 0, Math.PI * 2);
           ctx.fill();
@@ -899,11 +967,11 @@ def _iframe_doc(
         // Bar width: split the plot width into n slots, use ~75% of each.
         const barW = Math.max(1, (cw / n) * 0.75);
         ctx.fillStyle = hexA(s.color, 0.75);
-        const zeroY = toY(0);
+        const zeroY = _toY(0);
         for (let i = 0; i < n; i++) {{
           if (isGap(s.data[i])) continue;
           const cx = toX(visX[i]);
-          const topY = toY(s.data[i]);
+          const topY = _toY(s.data[i]);
           const bw = barW;
           const bx = cx - bw / 2;
           const by = Math.min(topY, zeroY);
@@ -940,7 +1008,7 @@ def _iframe_doc(
       function _fillSeg(a, b) {{
         ctx.beginPath();
         ctx.moveTo(toX(visX[a]), PAD.t + ch);
-        for (let i = a; i <= b; i++) ctx.lineTo(toX(visX[i]), toY(s.data[i]));
+        for (let i = a; i <= b; i++) ctx.lineTo(toX(visX[i]), _toY(s.data[i]));
         ctx.lineTo(toX(visX[b]), PAD.t + ch);
         ctx.closePath(); ctx.fill();
       }}
@@ -956,7 +1024,7 @@ def _iframe_doc(
       for (let i = 0; i < n; i++) {{
         if (isGap(s.data[i])) {{ penDown = false; continue; }}
         const x = toX(visX[i]);
-        const y = toY(s.data[i]);
+        const y = _toY(s.data[i]);
         if (!penDown) {{ ctx.moveTo(x, y); penDown = true; }}
         else ctx.lineTo(x, y);
       }}
@@ -1061,15 +1129,22 @@ def _iframe_doc(
       ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
       ctx.beginPath(); ctx.moveTo(xp, PAD.t); ctx.lineTo(xp, PAD.t + ch); ctx.stroke();
 
-      const yp0 = toY(visSeries[0].data[hover]);
-      ctx.strokeStyle = 'rgba(148,163,184,0.12)';
-      ctx.beginPath(); ctx.moveTo(PAD.l, yp0); ctx.lineTo(PAD.l + cw, yp0); ctx.stroke();
+      // Horizontal crosshair pinned to first visible series. Use that
+      // series's own y-mapper so dual-axis charts don't draw a crosshair
+      // at a position that disagrees with where the dot lands.
+      const refSeries = visSeries.find(s => Array.isArray(s.data));
+      if (refSeries && !isGap(refSeries.data[hover])) {{
+        const yp0 = toYFor(refSeries)(refSeries.data[hover]);
+        ctx.strokeStyle = 'rgba(148,163,184,0.12)';
+        ctx.beginPath(); ctx.moveTo(PAD.l, yp0); ctx.lineTo(PAD.l + cw, yp0); ctx.stroke();
+      }}
       ctx.setLineDash([]);
 
       for (const s of visSeries) {{
+        if (!Array.isArray(s.data)) continue;
         const vv = s.data[hover];
         if (isGap(vv)) continue;  // skip series without a value at this x
-        const y = toY(vv);
+        const y = toYFor(s)(vv);
         ctx.fillStyle = s.color;
         ctx.beginPath(); ctx.arc(xp, y, 4, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.stroke();

@@ -370,6 +370,7 @@ _SIGNAL_META: dict = {
 }
 
 
+@st.fragment
 def _render_composite_time_history(
     *,
     t_ev,
@@ -381,6 +382,13 @@ def _render_composite_time_history(
 ) -> None:
     """Pickable two-signal time-history overlay with a secondary y-axis.
 
+    Wrapped in ``@st.fragment`` so clicking a pill reruns ONLY this
+    fragment — Rows 1-3 (Load/Disp/Velocity/Accel/Hysteresis/Phase
+    Space) don't redraw, which removes ~500 ms of iframe re-mount cost
+    on every pair switch. The hidden trigger buttons live INSIDE the
+    fragment, so when the JS bridge fires their click() the resulting
+    rerun is fragment-scoped automatically.
+
     User clicks one of six combinations in the toolbar (data-attr
     bridged through ``__std_composite_<id>``). Each combo paints the
     primary signal against the LEFT y-axis (its native units) and the
@@ -391,10 +399,12 @@ def _render_composite_time_history(
     ss.setdefault("std_composite", "lv")
 
     # Hidden trigger buttons — visible toolbar pills bridge to these
+    # via JS .click(). No explicit ``st.rerun()`` needed: button clicks
+    # already trigger a (fragment-scoped) rerun, and the new
+    # ``std_composite`` value is read on the SAME run a few lines down.
     for cid, _label, _p, _s in _COMPOSITE_PAIRS:
         if st.button("·", key=f"__std_composite_{cid}"):
             ss["std_composite"] = cid
-            st.rerun()
 
     active_cid = ss["std_composite"]
     pair = next((p for p in _COMPOSITE_PAIRS if p[0] == active_cid), _COMPOSITE_PAIRS[0])

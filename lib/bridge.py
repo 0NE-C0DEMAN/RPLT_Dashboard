@@ -41,7 +41,6 @@ _BRIDGE_HTML = """
     ['data-cb-y',          '.st-key-__cb_y_'],
     ['data-rb-toggle',     '.st-key-__rb_toggle_'],
     ['data-rd-page',       '.st-key-__rd_page_'],
-    ['data-settings-tab',  '.st-key-__settings_tab_'],
     ['data-std-composite', '.st-key-__std_composite_'],
   ];
 

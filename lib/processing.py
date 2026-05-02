@@ -53,6 +53,178 @@ def infer_time_scale(col_name: str) -> tuple[float, str]:
     return 1.0, "s"
 
 
+def _score_accel_signal(
+    load: np.ndarray, accel: np.ndarray, t: np.ndarray,
+) -> float:
+    """Score how plausibly an accel column is the impact accelerometer.
+
+    Returns a value in [0, 1]. Higher = the column's peak lines up with
+    the load impact and stands clear of its noise floor. Used to auto-
+    pick the right accel channel on multi-channel acquisitions and to
+    auto-fall-back to Derive-from-Load when no column qualifies.
+
+    Components:
+      * **Time alignment** — how close is the accel's peak (centered)
+        to the load peak, scaled by total recording duration.
+      * **SNR** — peak amplitude vs full-file RMS. Real impacts blow
+        the noise floor; dead / disconnected sensors don't.
+      * **Saturation penalty** — clipped sensors plateau at the rail
+        for many samples; we down-weight them since the integration
+        will under-shoot the real peak.
+
+    All NaN-tolerant; returns 0 on any pathological input.
+    """
+    try:
+        t = np.asarray(t, dtype=float)
+        load = np.asarray(load, dtype=float)
+        a = np.asarray(accel, dtype=float)
+        if len(t) < 8 or len(t) != len(load) or len(t) != len(a):
+            return 0.0
+        finite = np.isfinite(load) & np.isfinite(a) & np.isfinite(t)
+        if finite.sum() < 8:
+            return 0.0
+        t = t[finite]; load = load[finite]; a = a[finite]
+        n = len(t)
+
+        # ── Load-event window ─────────────────────────────────────────
+        # Score within the impact window only, not the full recording.
+        # Whole-file noise is irrelevant for "is THIS column the impact
+        # accelerometer" — what matters is what the column does
+        # AROUND the moment of peak load.
+        peak_load_idx = int(np.argmax(np.abs(load)))
+        peak_load_amp = float(np.abs(load[peak_load_idx]))
+        thresh = 0.20 * peak_load_amp
+        # walk outward from peak until 50 consecutive below-threshold
+        below = 0; e_idx = n - 1
+        for i in range(peak_load_idx, n):
+            if abs(load[i]) < thresh:
+                below += 1
+                if below >= 50:
+                    e_idx = i - 49; break
+            else: below = 0
+        below = 0; s_idx = 0
+        for i in range(peak_load_idx, -1, -1):
+            if abs(load[i]) < thresh:
+                below += 1
+                if below >= 50:
+                    s_idx = i + 49; break
+            else: below = 0
+        if e_idx <= s_idx + 4:
+            return 0.0
+        # Pad outward by 25 % of window length on each side so the
+        # accel's peak (which can lead/lag the load slightly in real
+        # impacts) is still captured.
+        win_len = e_idx - s_idx
+        s_idx = max(0, s_idx - win_len // 4)
+        e_idx = min(n - 1, e_idx + win_len // 4)
+
+        a_win = a[s_idx:e_idx + 1]
+        t_win = t[s_idx:e_idx + 1]
+
+        # 1) Time alignment — accel peak (centered) should sit within
+        # 25 % of the load-peak time inside the event window.
+        a_centered_win = a_win - a_win.mean()
+        peak_a_idx_win = int(np.argmax(np.abs(a_centered_win)))
+        peak_load_idx_win = peak_load_idx - s_idx
+        dt = abs(float(t_win[peak_load_idx_win] - t_win[peak_a_idx_win]))
+        win_dur = float(t_win[-1] - t_win[0]) or 1.0
+        align_score = max(0.0, 1.0 - dt / (0.5 * win_dur))
+
+        # 2) SNR within the event window — peak amplitude vs RMS of
+        # the centered signal. A real accel sensor produces an impulse
+        # well above its in-window noise; a dead sensor doesn't.
+        rms = float(np.sqrt((a_centered_win ** 2).mean()))
+        peak_amp = float(np.max(np.abs(a_centered_win)))
+        snr = peak_amp / (rms + 1e-12)
+        snr_score = max(0.0, min(1.0, (snr - 2.0) / 6.0))
+
+        # ABSOLUTE-AMPLITUDE FLOOR — real RPLT impacts produce at least
+        # ~0.5 g of acceleration at the peak (≈5 m/s² when the column is
+        # already scaled). Below 0.05 in EITHER unit is sensor noise
+        # regardless of how cleanly it correlates with the load. This
+        # catches files where the accelerometer was disconnected or set
+        # to a dead-channel input — which look "correlated" only because
+        # any in-window noise happens to peak somewhere.
+        if peak_amp < 0.05:
+            return 0.0
+
+        # 3) Saturation penalty — judged within the event window so
+        # full-file row-count differences don't change the answer.
+        global_max = peak_amp
+        if global_max <= 0:
+            sat_penalty = 1.0
+        else:
+            flat_count = int(np.sum(np.abs(a_centered_win) >= 0.99 * global_max))
+            flat_frac = flat_count / len(a_centered_win)
+            if flat_frac > 0.20:    # heavily saturated inside the impulse
+                sat_penalty = 0.05
+            elif flat_frac > 0.05:
+                sat_penalty = 0.30
+            else:
+                sat_penalty = 1.0
+
+        return align_score * snr_score * sat_penalty
+    except Exception:
+        return 0.0
+
+
+def auto_pick_accel(
+    table_name: str, time_col: str, load_col: str,
+    accel_candidates: list[str], version: float = 0.0,
+    *, min_score: float = 0.05,
+) -> tuple[str, float, str]:
+    """Score every accel-candidate column against the load impact and
+    return the best.
+
+    Returns ``(picked_col, score, mode)`` where ``mode`` is one of:
+      * ``"sensor"``   — a real sensor column scored above ``min_score``;
+                          use it directly.
+      * ``"derive"``   — no column qualified; the caller should switch
+                          ``rgf_unit_accel`` to ``"derive"`` so the
+                          pipeline reconstructs accel from load via
+                          Newton's 2nd law (a = F / M).
+
+    Reads the full table — accel scoring needs the peak row, and stride
+    sampling can miss it on impulsive recordings. For typical RPLT
+    files (≤200k rows × ~10 candidate cols) the read is ~10 MB which
+    DuckDB handles in milliseconds.
+    """
+    if not accel_candidates:
+        return "", 0.0, "derive"
+    qt = quote_table_identifier(table_name)
+    qa_alias = ", ".join(
+        f"{quote_identifier(c)} AS __a{i}"
+        for i, c in enumerate(accel_candidates)
+    )
+    sql = (
+        f"SELECT {quote_identifier(time_col)} AS __t, "
+        f"{quote_identifier(load_col)} AS __l, "
+        f"{qa_alias} FROM {qt} ORDER BY __t"
+    )
+    df = run_custom_query(sql, version=version)
+    if df.empty:
+        return "", 0.0, "derive"
+
+    t   = pd.to_numeric(df["__t"], errors="coerce").to_numpy()
+    ld  = pd.to_numeric(df["__l"], errors="coerce").to_numpy()
+    # Adjust time scale — auto-detect from header so µs files don't
+    # break alignment scoring (would otherwise treat the whole
+    # recording as N µs ≈ instantaneous).
+    time_scale, _ = infer_time_scale(time_col)
+    t = t * time_scale
+
+    best_col, best_score = "", 0.0
+    for i, c in enumerate(accel_candidates):
+        a = pd.to_numeric(df[f"__a{i}"], errors="coerce").to_numpy()
+        s = _score_accel_signal(ld, a, t)
+        if s > best_score:
+            best_col, best_score = c, s
+
+    if best_score >= min_score:
+        return best_col, best_score, "sensor"
+    return (best_col or accel_candidates[0]), best_score, "derive"
+
+
 def infer_accel_is_mps2(col_name: str) -> bool:
     """True if the accel column is already in m/s² (i.e. pre-scaled by
     the acquisition software and we should NOT multiply by g again).

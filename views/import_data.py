@@ -359,7 +359,11 @@ def _render_data_setup() -> None:
     # their mapping under an older auto-pick rule). Seed the column
     # picks from auto-detection so the user has sensible defaults to
     # override.
-    AUTOPICK_VERSION = 2   # bump when the candidate lists change
+    # AUTOPICK_VERSION bumps whenever the auto-pick logic changes —
+    # forces existing sessions to re-seed under the new rules. v3 adds
+    # signal-quality scoring of accel candidates (auto-falls back to
+    # Derive-from-Load when no column tracks the impact).
+    AUTOPICK_VERSION = 3
     current_tbl = info.table_name if info else "_none_"
     needs_reseed = (
         ss.get("_rgf_colmap_table")   != current_tbl
@@ -368,14 +372,37 @@ def _render_data_setup() -> None:
     if needs_reseed:
         ss["_rgf_colmap_table"] = current_tbl
         ss["_rgf_colmap_ver"]   = AUTOPICK_VERSION
+        # Time + Load: header-based pick (fast, no data scan needed)
         ss["rgf_map_time"]  = _pick_col(cols, ["time (s)", "time", "t"]) or cols[0]
-        ss["rgf_map_accel"] = _pick_col(cols, ["scaled (m/s2)", "acceleration scaled", "accel scaled", "acceleration raw", "accel"]) or cols[0]
         ss["rgf_map_load"]  = _pick_col(cols, ["load (kn)", "load summ", "load sum", "load scaled", "load", "force", "LOAD"]) or cols[0]
-        # Reset unit overrides to auto when a new file loads — the old
-        # choice usually won't apply to the new file's semantics.
+
+        # Accel: SCORED pick. Scan every column whose name contains
+        # "accel", measure how well each one tracks the load impact
+        # (peak-time alignment + SNR + saturation penalty), and use the
+        # best. If nothing scores well, switch to Derive-from-Load so
+        # the user immediately gets correct charts on files where the
+        # accel sensor was dead / off-event / saturated.
+        accel_candidates = [c for c in cols if "accel" in c.lower()]
+        if not accel_candidates:
+            accel_candidates = [_pick_col(cols, ["scaled (m/s2)", "acceleration scaled", "accel scaled", "acceleration raw", "accel"]) or cols[0]]
         ss["rgf_unit_time"]  = "auto"
-        ss["rgf_unit_accel"] = "auto"
         ss["rgf_unit_load"]  = "auto"
+        try:
+            from lib.processing import auto_pick_accel
+            picked, score, mode = auto_pick_accel(
+                info.table_name, ss["rgf_map_time"], ss["rgf_map_load"],
+                accel_candidates, version=v,
+            )
+            ss["rgf_map_accel"] = picked or accel_candidates[0]
+            ss["rgf_unit_accel"] = "derive" if mode == "derive" else "auto"
+            ss["_rgf_accel_score"] = float(score)
+            ss["_rgf_accel_mode"]  = mode
+        except Exception:
+            # Defensive fall-back on any DuckDB / numerics surprise.
+            ss["rgf_map_accel"]  = accel_candidates[0]
+            ss["rgf_unit_accel"] = "auto"
+            ss["_rgf_accel_score"] = 0.0
+            ss["_rgf_accel_mode"]  = "sensor"
 
     # Defensive defaults — if anything above missed (e.g. session state
     # partially restored after a hot-reload), fall back to the first

@@ -493,12 +493,20 @@ def _render_composite_time_history(
     p_color, p_label, _ = _meta(primary_id)
     s_color, s_label, _ = _meta(secondary_id)
 
-    # Visible pill toolbar
+    # Visible pill toolbar — rendered OUTSIDE the chart's iframe so the
+    # parent-document JS bridge sees the clicks. (Click events inside an
+    # ``st.components.v1.html`` iframe don't bubble across the iframe
+    # boundary, so anything that needs to bridge to a hidden st.button
+    # has to live in the host page.)
     pills = "".join(
         '<button type="button" '
         + f'class="rgf-btn-sm{" active" if cid == active_cid else ""}" '
         + f'data-std-composite="{cid}">{html_mod.escape(label)}</button>'
         for cid, label, _, _ in _COMPOSITE_PAIRS
+    )
+    st.markdown(
+        f'<div class="rgf-std-composite-toolbar">{pills}</div>',
+        unsafe_allow_html=True,
     )
 
     chart_panel(
@@ -512,7 +520,7 @@ def _render_composite_time_history(
         y_label=p_label,
         y_label_right=s_label,
         height=_H_ROW3,
-        actions_html=pills + icon_btn("download", title="Export"),
+        actions_html=icon_btn("download", title="Export"),
         key=f"std_composite_{active_cid}",
     )
 
